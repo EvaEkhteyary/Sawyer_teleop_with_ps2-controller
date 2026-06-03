@@ -1,7 +1,4 @@
 
-# toplevel CMakeLists.txt for a catkin workspace
-# catkin/cmake/toplevel.cmake
-
 cmake_minimum_required(VERSION 3.0.2)
 
 docker cp ps2_sawyer_dev:/root/ps2_sawyer_ws/src/CMakeLists.txt ~/ps2_sawyer_ws/src/CMakeLists.txtproject(Project)
