@@ -1,3 +1,4 @@
+
 #!/bin/bash
 # Copyright (c) 2013-2016, Rethink Robotics
 # All rights reserved.
@@ -23,7 +24,7 @@ robot_hostname="192.168.1.21"
 
 # Set *Either* your computers ip address or hostname. Please note if using
 # your_hostname that this must be resolvable to the Robot.
-your_ip="192.168.1.71"
+your_ip="192.168.1.153"
 #your_hostname="my_computer.local"
 
 # Specify ROS distribution (e.g. kinetic, indigo, hydro, etc.)

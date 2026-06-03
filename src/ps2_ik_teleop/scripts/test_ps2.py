@@ -3,27 +3,26 @@
 ps2_sawyer_teleop_viz.py — Generic USB gamepad teleop for Sawyer + RViz
 ========================================================================
 Confirmed button/axis indices from your controller:
-  A=0  B=1  X=2  Y=3  L=4  R=5  Select=6  Start=7  Mode=8
+  A=0  B=1  X=2  Y=3  L1=4  L2=5  Select=6  Start=7  Mode=8
   Left stick click=9  Right stick click=10
 
 CONTROL SCHEME
 ══════════════
-  POSITION (hold L to enable all motion)
+  POSITION / ORIENTATION  (hold L1 or L2 to enable motion)
     Left  stick  fwd/back   → EE +X / -X
     Left  stick  left/right → EE +Y / -Y
-    Right stick  fwd/back   → EE +Z / -Z  (up/down)
 
-  ORIENTATION  (two modes, toggle with Y button)
-    Mode 0 — YAW only (default, easiest for pick-and-place):
+    Hold L1 (button 4) — DEFAULT mode (yaw + Z):
+      Right stick  fwd/back   → EE +Z / -Z  (up/down)
       Right stick  left/right → yaw
 
-    Mode 1 — ROLL + PITCH (for fine orientation control):
+    Hold L2 (button 5) — ROLL+PITCH mode (fine orientation):
       Right stick  left/right → roll
       Right stick  fwd/back   → pitch
-      (yaw is frozen in this mode)
+      (Z is frozen in this mode)
 
   GRIPPER
-    R  (button 5)   → toggle open / close
+    Y  (button 3)   → toggle open / close
 
   HOMING
     A  (button 0)   → startup: move to HOME (safe interpolation)
@@ -33,18 +32,17 @@ CONTROL SCHEME
 
   ORIENTATION HELPERS
     X  (button 2)   → reset orientation to home (clears accumulated drift)
-    Y  (button 3)   → toggle orientation mode  (yaw-only ↔ roll+pitch)
 
   KEYBOARD
     r               → same as Start (return to HOME)
 """
 
+# libraries
 import sys
 import os
 import math
 import importlib.util
-import intera_interface
-
+import intera_interface                          # Sawyer SDK
 import rospy
 import tf2_ros
 import tf.transformations as tft
@@ -54,80 +52,115 @@ from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker
 import pygame
 
-# ─── RelaxedIK ─────────────────────────────────────────────────────────────
-_RIK_ROOT     = '/root/catkin_ws/src/relaxed_ik_core'
-_RIK_WRAPPER  = _RIK_ROOT + '/wrappers/python_wrapper.py'
-_RIK_SETTINGS = _RIK_ROOT + '/configs/settings.yaml'
+# ─── relaxedIK solver from directory ──────────────────────────────────────
+_RIK_ROOT     = '/root/catkin_ws/src/relaxed_ik_core'       # repository
+_RIK_WRAPPER  = _RIK_ROOT + '/wrappers/python_wrapper.py'   # Python bindings
+_RIK_SETTINGS = _RIK_ROOT + '/configs/settings.yaml'        # robot config
 
 _spec = importlib.util.spec_from_file_location("python_wrapper", _RIK_WRAPPER)
 _mod  = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_mod)
-RelaxedIKRust = _mod.RelaxedIKRust
+_spec.loader.exec_module(_mod)                   # dynamically import wrapper
+RelaxedIKRust = _mod.RelaxedIKRust               # IK solver class
 
-# ─── Robot constants ───────────────────────────────────────────────────────
+# ─── robot joint names ─────────────────────────────────────────────────────
 JOINT_NAMES = [
     'right_j0', 'right_j1', 'right_j2',
     'right_j3', 'right_j4', 'right_j5', 'right_j6'
 ]
+# gripper finger joints (robotiq 2F-85 mimic chain)
 GRIPPER_JOINT_NAMES = [
     'finger_joint',
     'right_outer_knuckle_joint',
     'left_inner_knuckle_joint',  'right_inner_knuckle_joint',
     'left_inner_finger_joint',   'right_inner_finger_joint',
 ]
-GRIPPER_OPEN        = 0.0
-GRIPPER_CLOSE       = 0.8
-DEFAULT_HOME_CONFIG = [0.3474, -1.3143, -0.5663, 1.3630, 0.0967, 1.4469, 3.0276]
+GRIPPER_OPEN        = 0.0   # fully open finger position (rad)
+GRIPPER_CLOSE       = 0.8   # fully closed finger position (rad)
 
-# ─── Safe-homing settings ──────────────────────────────────────────────────
-SAFE_HOME_SPEED       = 0.15   # 0–1 fraction of max joint speed
-SAFE_HOME_TIMEOUT     = 15.0   # seconds total
-SAFE_HOME_STEPS       = 8      # waypoints between current and home
-SAFE_HOME_STEP_THRESH = 0.01   # rad — skip waypoint if delta < this
-J6_MAX_DELTA_PER_STEP = 0.40   # rad — max wrist rotation per waypoint
+DEFAULT_HOME_CONFIG = [0.2984, -1.2459, -0.6619, 1.3025, 0.2306, 1.5009, -0.2057]
 
-BASE_FRAME  = 'reference/base'
-EE_FRAME    = 'reference/right_hand'
-TOOL_LENGTH = 0.212
+# ─── when moving sawyer to home position, the settings ────────────────────
+SAFE_HOME_SPEED       = 0.15   # 0–1 joint speed
+SAFE_HOME_TIMEOUT     = 15.0
+SAFE_HOME_STEPS       = 8      # steps to take
+SAFE_HOME_STEP_THRESH = 0.01   # rad — joint is close to home then skip
+J6_MAX_DELTA_PER_STEP = 0.40   # max rotation wrist joint
 
-# ─── Sensor bowl dimensions ────────────────────────────────────────────────
-BOWL_OUTER = 0.80
-BOWL_BASE  = 0.24
-BOWL_RISE  = 0.09
-BOWL_THICK = 0.005
-BRKT_TALL  = 0.09
-BRKT_SHORT = 0.05
+# ─── TF frame names ────────────────────────────────────────────────────────
+BASE_FRAME  = 'reference/base'       # robot base frame
+EE_FRAME    = 'reference/right_hand' # end-effector frame
+TOOL_LENGTH = 0.212                  # fingertip offset from wrist (metres)
 
-# ─── Controller mapping (confirmed indices) ────────────────────────────────
+# ─── Sensor bowl RViz dimensions ───────────────────────────────────────────
+BOWL_OUTER = 0.80    # outer rim diameter (m)
+BOWL_BASE  = 0.24    # flat inner base size (m)
+BOWL_RISE  = 0.09    # slope rise height (m)
+BOWL_THICK = 0.005   # wall/floor thickness (m)
+BRKT_TALL  = 0.09    # bracket tall side (m)
+BRKT_SHORT = 0.05    # bracket short side (m)
+
+# ─── controller button indices (confirmed for this gamepad) ────────────────
 BTN_A      = 0    # startup: go to HOME
 BTN_B      = 1    # startup: skip home
 BTN_X      = 2    # reset orientation to home
-BTN_Y      = 3    # toggle orientation mode
-BTN_L      = 4    # hold to ENABLE all motion
-BTN_R      = 5    # toggle gripper
+BTN_Y      = 3    # toggle gripper
+BTN_L1     = 4    # hold → enable motion, mode 0 (yaw + Z)
+BTN_L2     = 5    # hold → enable motion, mode 1 (roll + pitch)
 BTN_SELECT = 6    # re-anchor IK
 BTN_START  = 7    # return to HOME
 BTN_MODE   = 8    # (spare)
 BTN_LS     = 9    # left stick click  (spare)
 BTN_RS     = 10   # right stick click (spare)
 
+# ─── controller axis indices ───────────────────────────────────────────────
 AXIS_LX = 0   # left stick horizontal  → robot Y
 AXIS_LY = 1   # left stick vertical    → robot X  (inverted below)
 AXIS_RX = 3   # right stick horizontal → yaw / roll
 AXIS_RY = 4   # right stick vertical   → Z / pitch (inverted below)
 
-STICK_DEADZONE = 0.10   # ignore stick values below this
+# DEADZONE — only one threshold needed; STICK_MIN_TOTAL removed (redundant)
+STICK_DEADZONE = 0.12   # ignore stick values below this (per-axis)
 
-# Velocity scales (per second at full deflection)
-XY_VEL_SCALE    = 0.15   # m/s
-Z_VEL_SCALE     = 0.10   # m/s
-YAW_VEL_SCALE   = 0.40   # rad/s
-ROLL_VEL_SCALE  = 0.30   # rad/s
-PITCH_VEL_SCALE = 0.30   # rad/s
+# ─── velocity scales — how fast the EE moves at full stick deflection ──────
+# Kept moderate — proximity scaling handles the sensitive near-base region
+XY_VEL_SCALE    = 0.20   # m/s
+Z_VEL_SCALE     = 0.14   # m/s
+YAW_VEL_SCALE   = 0.45   # rad/s
+ROLL_VEL_SCALE  = 0.35   # rad/s
+PITCH_VEL_SCALE = 0.35   # rad/s
+
+# ─── IK smoothing — ONE layer only, applied to joint commands ─────────────
+# The previous code had 4 stacked damping layers (goal EMA + cartesian clamp
+# + joint rate-limit + joint EMA) which caused quantised micro-steps and
+# audible motor buzzing.  We keep only the joint-space EMA + rate-limit.
+JOINT_SMOOTH_ALPHA = 0.35   # EMA weight for new IK solution (0=frozen, 1=raw)
+MAX_JOINT_DELTA    = 0.08   # max rad any joint can jump per cycle
+JOINT_CMD_DEADBAND = 0.0005 # rad — skip robot command if no joint changed more
+                             # than this. Kept tiny so slow stick motion isn't
+                             # quantised into discrete steps.
+
+# ─── Sawyer joint limits (rad) ─────────────────────────────────────────────
+JOINT_LIMITS = [
+    (-3.0503,  3.0503),  # right_j0
+    (-3.8095,  2.2736),  # right_j1
+    (-3.0426,  3.0426),  # right_j2
+    (-3.0439,  3.0439),  # right_j3
+    (-2.9761,  2.9761),  # right_j4
+    (-2.9761,  2.9761),  # right_j5
+    (-4.7124,  4.7124),  # right_j6
+]
+
+# ─── Smooth homing parameters ──────────────────────────────────────────────
+HOME_RATE_HZ          = 50     # Hz for homing interpolation loop
+HOME_DURATION_PER_RAD = 2.5    # seconds per radian of largest joint travel
+HOME_MIN_DURATION     = 3.0    # minimum homing duration (s)
+HOME_MAX_DURATION     = 10.0   # maximum homing duration (s)
 
 
-# ─── Marker helpers ────────────────────────────────────────────────────────
+# ─── RViz marker helper functions ──────────────────────────────────────────
+
 def _sphere(ns, mid, r, g, b, size=0.025):
+    """Return a sphere Marker (used for goal/actual EE position dots)."""
     m = Marker()
     m.header.frame_id = BASE_FRAME
     m.ns, m.id = ns, mid
@@ -139,6 +172,7 @@ def _sphere(ns, mid, r, g, b, size=0.025):
     return m
 
 def _text(ns, mid):
+    """Return a text Marker (used for the HUD overlay in RViz)."""
     m = Marker()
     m.header.frame_id = BASE_FRAME
     m.ns, m.id = ns, mid
@@ -151,6 +185,7 @@ def _text(ns, mid):
     return m
 
 def _build_sensor_bowl_markers(cx, cy, cz):
+    """Build a list of Markers that draw the sensor bowl in RViz."""
     markers = []
     uid = 100
     GREY = ColorRGBA(0.45, 0.45, 0.50, 0.90)
@@ -236,11 +271,12 @@ def _build_sensor_bowl_markers(cx, cy, cz):
     return markers
 
 
-# ─── Main node ─────────────────────────────────────────────────────────────
+# ─── Main teleop node ──────────────────────────────────────────────────────
 class PS2TeleopVizNode:
     def __init__(self):
         rospy.init_node('ps2_sawyer_teleop_viz', anonymous=False)
 
+        # ── ROS parameters ───────────────────────────────────────────────
         self.control_rate     = rospy.get_param('~control_rate',     50.0)
         self.workspace_centre = rospy.get_param('~workspace_centre', [0.70, 0.0, 0.20])
 
@@ -251,7 +287,7 @@ class PS2TeleopVizNode:
 
         self.HOME_CONFIG = list(DEFAULT_HOME_CONFIG)
 
-        # ── pygame ───────────────────────────────────────────────────────
+        # ── Gamepad init ─────────────────────────────────────────────────
         pygame.init()
         pygame.joystick.init()
         if pygame.joystick.get_count() == 0:
@@ -265,15 +301,15 @@ class PS2TeleopVizNode:
                       self._joy.get_numbuttons())
         self._prev_btn = {}
 
-        # ── TF ───────────────────────────────────────────────────────────
+        # ── TF listener ──────────────────────────────────────────────────
         self._tf_buf = tf2_ros.Buffer()
         self._tf_lis = tf2_ros.TransformListener(self._tf_buf)
 
-        # ── Joint state publisher ────────────────────────────────────────
+        # ── Joint state publisher ─────────────────────────────────────────
         self._js_pub = rospy.Publisher('/joint_states', JointState, queue_size=5)
         self._current_angles = list(self.HOME_CONFIG)
 
-        # ── RelaxedIK ────────────────────────────────────────────────────
+        # ── RelaxedIK solver ─────────────────────────────────────────────
         rospy.loginfo("[ctrl] Loading RelaxedIK...")
         saved = os.getcwd()
         os.chdir(_RIK_ROOT)
@@ -283,14 +319,14 @@ class PS2TeleopVizNode:
             os.chdir(saved)
         rospy.loginfo("[ctrl] RelaxedIK OK")
 
-        # ── Enable robot safety system ───────────────────────────────
+        # ── Enable Sawyer safety system ──────────────────────────────────
         rs = intera_interface.RobotEnable(intera_interface.CHECK_VERSION)
         rs.enable()
         rospy.loginfo("[ctrl] Robot enabled")
 
         self._limb = intera_interface.Limb('right')
 
-        # ── Gripper ──────────────────────────────────────────────────────
+        # ── Robotiq gripper init ─────────────────────────────────────────
         try:
             from pyrobotiqgripper import RobotiqGripper
             self._gripper       = RobotiqGripper()
@@ -303,7 +339,7 @@ class PS2TeleopVizNode:
             rospy.logwarn("[ctrl] Gripper init failed: %s", e)
         self._gripper_open = False
 
-        # ── Markers ──────────────────────────────────────────────────────
+        # ── RViz marker setup ────────────────────────────────────────────
         self._mk_pub    = rospy.Publisher('/teleop_viz', Marker, queue_size=20)
         self._mk_goal   = _sphere("goal",   0, 0.0, 1.0, 0.0, 0.03)
         self._mk_actual = _sphere("actual", 1, 1.0, 0.0, 0.0, 0.03)
@@ -364,37 +400,71 @@ class PS2TeleopVizNode:
         self._mk_wood_box.color   = ColorRGBA(0.82, 0.65, 0.40, 1.0)
         self._mk_wood_box.pose.orientation.w = 1.0
 
-        # ── Teleop state ─────────────────────────────────────────────────
-        self._enabled        = False
-        self._current_goal   = None
-        self._home_pos       = None
-        self._home_quat      = None
+        # ── Teleop runtime state ─────────────────────────────────────────
+        self._enabled          = False
+        self._current_goal     = None
+        self._home_pos         = None
+        self._home_quat        = None
+        self._cmd_angles       = list(self.HOME_CONFIG)
+        self._last_sent_angles = list(self.HOME_CONFIG)   # deadband comparison
+        self._viz_tick         = 0
 
-        # Orientation: stored as roll/pitch/yaw (integrated separately)
         self._ori_roll  = 0.0
         self._ori_pitch = 0.0
         self._ori_yaw   = 0.0
+        self._ori_mode  = 0   # 0 = yaw+Z (L1),  1 = roll+pitch (L2)
 
-        # Mode 0 = yaw only (right stick X → yaw, right stick Y → Z)
-        # Mode 1 = roll+pitch (right stick X → roll, right stick Y → pitch)
-        self._ori_mode  = 0
+    # ─── Low-level input helpers ───────────────────────────────────────────
 
-    # ── Low-level helpers ──────────────────────────────────────────────────
     def _axis(self, idx):
+        """Read a stick axis and zero it if inside the deadzone."""
         v = self._joy.get_axis(idx)
         return v if abs(v) > STICK_DEADZONE else 0.0
 
     def _btn_pressed(self, idx):
-        """Rising-edge detection (single shot per press)."""
+        """Return True only on the rising edge (button just pressed)."""
         cur  = bool(self._joy.get_button(idx))
         prev = self._prev_btn.get(idx, False)
         self._prev_btn[idx] = cur
         return cur and not prev
 
     def _btn_held(self, idx):
+        """Return True as long as the button is physically held down."""
         return bool(self._joy.get_button(idx))
 
+    # ─── Proximity scaling — only anti-jitter helper kept ─────────────────
+    # The previous version had four stacked damping layers:
+    #   1. CARTESIAN_MAX_DELTA (goal clamp)
+    #   2. POSITION_SMOOTH_ALPHA (goal EMA)
+    #   3. MAX_JOINT_DELTA (joint rate-limit)
+    #   4. JOINT_SMOOTH_ALPHA (joint EMA)
+    # Layers 1 and 2 caused quantised micro-steps and audible motor buzzing
+    # because the goal barely moved each cycle, so IK produced tiny repeated
+    # joint adjustments that the motors tried (and failed) to track smoothly.
+    # We keep only layers 3 and 4 (joint-space), which is the right place to
+    # filter because it directly controls what the servo controllers see.
+    # Proximity scaling is kept because it addresses the actual root cause
+    # (singularity amplification near the base) rather than masking it.
+
+    PROXIMITY_RADIUS = 0.35   # m from home where XY motion is scaled down
+    PROXIMITY_SCALE  = 0.75   # multiplier applied to XY delta near base
+
+    def _apply_proximity_scale(self, new_gx, new_gy):
+        """Scale down XY delta when close to home to reduce singularity amplification."""
+        if self._home_pos is None:
+            return new_gx, new_gy
+        hx, hy, _ = self._home_pos
+        dist = math.hypot(self._current_goal[0] - hx, self._current_goal[1] - hy)
+        if dist < self.PROXIMITY_RADIUS:
+            dx = (new_gx - self._current_goal[0]) * self.PROXIMITY_SCALE
+            dy = (new_gy - self._current_goal[1]) * self.PROXIMITY_SCALE
+            return self._current_goal[0] + dx, self._current_goal[1] + dy
+        return new_gx, new_gy
+
+    # ─── Joint / robot publishing ──────────────────────────────────────────
+
     def _publish_joint_states(self, angles, command_robot=True):
+        """Publish joint angles to /joint_states (RViz) and optionally to hardware."""
         v = GRIPPER_OPEN if self._gripper_open else GRIPPER_CLOSE
         gripper_pos = [v, v, v, v, -v, -v]
         msg = JointState()
@@ -405,58 +475,54 @@ class PS2TeleopVizNode:
         msg.effort   = [0.0] * (7 + len(GRIPPER_JOINT_NAMES))
         self._js_pub.publish(msg)
         if command_robot:
-            self._limb.set_joint_positions(dict(zip(JOINT_NAMES, angles)))
+            try:
+                self._limb.set_joint_positions(dict(zip(JOINT_NAMES, angles)))
+            except Exception as e:
+                rospy.logwarn("[hw] set_joint_positions failed: %s", e)
         self._current_angles = list(angles)
 
     def _lookup_ee(self):
+        """Look up EE transform from TF. Returns (pos, quat) or (None, None)."""
         try:
             t  = self._tf_buf.lookup_transform(
-                BASE_FRAME, EE_FRAME, rospy.Time(0), rospy.Duration(1.0))
+                BASE_FRAME, EE_FRAME, rospy.Time(0), rospy.Duration(0.0))
             tr = t.transform.translation
             ro = t.transform.rotation
             return [tr.x, tr.y, tr.z], [ro.x, ro.y, ro.z, ro.w]
         except Exception:
             return None, None
 
-    # ── Safe homing ────────────────────────────────────────────────────────
+    # ─── Homing ────────────────────────────────────────────────────────────
+
     def _move_to_home(self):
-        rospy.loginfo("[ctrl] Reading current joint angles...")
-        cur = self._limb.joint_angles()
-        current = [cur.get(n, self.HOME_CONFIG[i]) for i, n in enumerate(JOINT_NAMES)]
+        """Smoothly drive all joints to HOME using cosine-eased set_joint_positions."""
+        rospy.loginfo("[ctrl] Reading current joints for homing...")
+        cur_dict = self._limb.joint_angles()
+        current  = [cur_dict.get(n, self.HOME_CONFIG[i]) for i, n in enumerate(JOINT_NAMES)]
 
         rospy.loginfo("[ctrl] Current: %s", [f"{a:.3f}" for a in current])
         rospy.loginfo("[ctrl] Target:  %s", [f"{a:.3f}" for a in self.HOME_CONFIG])
 
-        j6_delta = abs(self.HOME_CONFIG[6] - current[6])
-        n_steps  = max(SAFE_HOME_STEPS,
-                       math.ceil(j6_delta / J6_MAX_DELTA_PER_STEP) + 1)
-        step_timeout = SAFE_HOME_TIMEOUT / n_steps
+        max_delta = max(abs(self.HOME_CONFIG[i] - current[i]) for i in range(7))
+        duration  = max(HOME_MIN_DURATION,
+                        min(HOME_MAX_DURATION, max_delta * HOME_DURATION_PER_RAD))
+        n_steps   = int(duration * HOME_RATE_HZ)
+        rate      = rospy.Rate(HOME_RATE_HZ)
 
-        rospy.loginfo("[ctrl] Homing: %d steps, j6 travel=%.3f rad, speed=%.2f",
-                      n_steps, j6_delta, SAFE_HOME_SPEED)
+        rospy.loginfo("[ctrl] Homing: %.1f s, %d steps (max delta=%.3f rad)",
+                      duration, n_steps, max_delta)
 
-        self._limb.set_joint_position_speed(SAFE_HOME_SPEED)
         for step in range(1, n_steps + 1):
             if rospy.is_shutdown():
                 return
-            alpha    = step / n_steps
-            waypoint = {}
-            for i, name in enumerate(JOINT_NAMES):
-                target = current[i] + alpha * (self.HOME_CONFIG[i] - current[i])
-                if step == n_steps or abs(target - current[i]) >= SAFE_HOME_STEP_THRESH:
-                    waypoint[name] = target
-            if not waypoint:
-                continue
-            rospy.loginfo("[ctrl] Step %d/%d  j6=%.3f", step, n_steps,
-                          waypoint.get(JOINT_NAMES[6],
-                                       current[6] + alpha*(self.HOME_CONFIG[6]-current[6])))
-            try:
-                self._limb.move_to_joint_positions(waypoint, timeout=step_timeout)
-            except Exception as e:
-                rospy.logwarn("[ctrl] Waypoint %d failed: %s", step, e)
+            t    = step / n_steps
+            ease = 0.5 - 0.5 * math.cos(math.pi * t)   # cosine ease-in-out
+            waypoint = {name: current[i] + ease * (self.HOME_CONFIG[i] - current[i])
+                        for i, name in enumerate(JOINT_NAMES)}
+            self._limb.set_joint_positions(waypoint)
+            rate.sleep()
 
-        rospy.loginfo("[ctrl] HOME reached safely")
-        self._limb.set_joint_position_speed(1.0)   # restore full speed for teleop
+        rospy.loginfo("[ctrl] HOME reached")
 
     def _reset_orientation_to_home(self):
         """Snap the integrated roll/pitch/yaw back to the home orientation."""
@@ -467,8 +533,10 @@ class PS2TeleopVizNode:
             self._ori_yaw   = y
             rospy.loginfo("[ctrl] Orientation reset to home (r=%.3f p=%.3f y=%.3f)", r, p, y)
 
-    # ── Marker publishing ──────────────────────────────────────────────────
+    # ─── RViz marker publishers ────────────────────────────────────────────
+
     def _publish_box(self):
+        """Publish the transparent workspace boundary box and red wireframe edges."""
         hx, hy, _ = self._home_pos
         x0, x1 = hx - 0.40, hx + 0.40
         y0, y1 = hy - 0.40, hy + 0.40
@@ -492,6 +560,7 @@ class PS2TeleopVizNode:
         self._mk_pub.publish(self._mk_box_edges)
 
     def _publish_sensor_bowl(self):
+        """Publish all sensor bowl markers."""
         now = rospy.Time.now()
         hx, hy, _ = self._home_pos
         cz = float(self._sensor_bowl_pos[2])
@@ -500,6 +569,7 @@ class PS2TeleopVizNode:
             self._mk_pub.publish(m)
 
     def _publish_table(self):
+        """Publish the table surface, four legs, and wooden sensor platform."""
         hx, hy, _ = self._home_pos
         now = rospy.Time.now()
         table_top_z = 0.0
@@ -527,20 +597,24 @@ class PS2TeleopVizNode:
         self._mk_pub.publish(self._mk_wood_box)
 
     def _publish_markers(self, goal_pos, actual_pos, enabled):
+        """Publish goal sphere, actual EE sphere, and HUD text overlay."""
         now = rospy.Time.now()
-        mode_str = "YAW-only" if self._ori_mode == 0 else "ROLL+PITCH"
+        mode_str = "L1:YAW+Z" if self._ori_mode == 0 else "L2:ROLL+PITCH"
+
         if goal_pos:
             self._mk_goal.header.stamp = now
             self._mk_goal.pose.position.x = goal_pos[0]
             self._mk_goal.pose.position.y = goal_pos[1]
             self._mk_goal.pose.position.z = goal_pos[2]
             self._mk_pub.publish(self._mk_goal)
+
         if actual_pos:
             self._mk_actual.header.stamp = now
             self._mk_actual.pose.position.x = actual_pos[0]
             self._mk_actual.pose.position.y = actual_pos[1]
             self._mk_actual.pose.position.z = actual_pos[2] - TOOL_LENGTH
             self._mk_pub.publish(self._mk_actual)
+
         if goal_pos and actual_pos:
             err = math.sqrt(sum((a-b)**2 for a,b in zip(goal_pos, actual_pos)))
             self._mk_info.header.stamp = now
@@ -556,8 +630,10 @@ class PS2TeleopVizNode:
             )
             self._mk_pub.publish(self._mk_info)
 
-    # ── Entry point ────────────────────────────────────────────────────────
+    # ─── Entry point ────────────────────────────────────────────────────────
+
     def run(self):
+        """Save terminal settings, run the node, restore terminal on exit."""
         import termios
         old_term = termios.tcgetattr(sys.stdin)
         try:
@@ -566,10 +642,10 @@ class PS2TeleopVizNode:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
 
     def _run_inner(self):
+        """Main startup + control loop."""
         import select, termios, tty as _tty
         _tty.setcbreak(sys.stdin.fileno())
 
-        # ── Read current joints for display ──────────────────────────────
         cur_dict   = self._limb.joint_angles()
         cur_angles = [cur_dict.get(n, self.HOME_CONFIG[i])
                       for i, n in enumerate(JOINT_NAMES)]
@@ -599,11 +675,20 @@ class PS2TeleopVizNode:
 
         if go_home:
             self._move_to_home()
-            warmup_angles = list(self.HOME_CONFIG)
+            actual = self._limb.joint_angles()
+            actual_list = [actual.get(n, self.HOME_CONFIG[i])
+                           for i, n in enumerate(JOINT_NAMES)]
+            self._current_angles   = actual_list
+            self._cmd_angles       = actual_list
+            self._last_sent_angles = actual_list
+            self.rik.reset(actual_list)
+            warmup_angles = actual_list
         else:
             rospy.loginfo("[ctrl] Skipping home — seeding IK from current angles")
             self.rik.reset(cur_angles)
-            self._current_angles = cur_angles
+            self._current_angles   = cur_angles
+            self._cmd_angles       = cur_angles
+            self._last_sent_angles = cur_angles
             warmup_angles = cur_angles
 
         # ── TF warmup ────────────────────────────────────────────────────
@@ -623,53 +708,76 @@ class PS2TeleopVizNode:
         rospy.loginfo("[ctrl] EE start: [%.4f, %.4f, %.4f]", *pos)
 
         self._current_goal = list(pos)
-        self._reset_orientation_to_home()   # seed RPY from actual home quat
+        self._reset_orientation_to_home()
+        self._cmd_angles = list(warmup_angles)
+
+        # ── Wait for all buttons released before teleop ───────────────────
+        rospy.loginfo("[ctrl] Release all controller buttons to begin teleop...")
+        while not rospy.is_shutdown():
+            pygame.event.pump()
+            if not any(self._joy.get_button(i)
+                       for i in range(self._joy.get_numbuttons())):
+                break
+            rospy.sleep(0.05)
+        self._prev_btn = {}
+        rospy.loginfo("[ctrl] All buttons released — teleop active")
 
         print("\n" + "="*62)
         print("  CONTROLS")
         print("="*62)
-        print("  Hold [L]          → enable motion")
-        print("  Left  stick       → X / Y position")
-        print("  Right stick Y     → Z position (up/down)")
-        print("  Right stick X     → YAW  (mode 0, default)")
-        print("                      ROLL (mode 1)")
-        print("  [Y]               → toggle orientation mode")
-        print("                      mode 0: yaw-only")
-        print("                      mode 1: roll + pitch")
+        print("  Hold [L1]         → enable motion, default mode")
+        print("                      Left stick   → X / Y position")
+        print("                      Right stick Y → Z (up/down)")
+        print("                      Right stick X → YAW")
+        print("  Hold [L2]         → enable motion, roll+pitch mode")
+        print("                      Left stick   → X / Y position")
+        print("                      Right stick X → ROLL")
+        print("                      Right stick Y → PITCH  (Z frozen)")
         print("  [X]               → reset orientation to home")
-        print("  [R]               → toggle gripper open/close")
+        print("  [Y]               → toggle gripper open/close")
         print("  [Start]           → return to HOME (safe)")
         print("  [Select]          → re-anchor IK at current pos")
         print("  keyboard 'r'      → same as Start")
         print("="*62 + "\n")
 
-        dt   = 1.0 / self.control_rate
+        dt   = min(1.0 / self.control_rate, 0.05)   # cap dt to avoid huge jumps after lag
         rate = rospy.Rate(self.control_rate)
 
+        # ══════════════════════════════════════════════════════════════════
+        # Main control loop
+        # ══════════════════════════════════════════════════════════════════
         while not rospy.is_shutdown():
             pygame.event.pump()
 
-            # ── Keyboard shortcut ────────────────────────────────────────
+            # ── Keyboard 'r' → HOME ───────────────────────────────────────
             if select.select([sys.stdin], [], [], 0)[0]:
                 key = sys.stdin.read(1)
                 if key.lower() == 'r':
                     rospy.loginfo("[ctrl] 'r' — returning to HOME")
                     self._move_to_home()
-                    self._current_goal = list(self._home_pos)
-                    self._reset_orientation_to_home()
-                    self._enabled        = False
-                    self._current_angles = list(self.HOME_CONFIG)
+                    actual = self._limb.joint_angles()
+                    al = [actual.get(n, self.HOME_CONFIG[i]) for i, n in enumerate(JOINT_NAMES)]
+                    self._current_goal     = list(self._home_pos)
+                    self._enabled          = False
+                    self._current_angles   = al
+                    self._cmd_angles       = al
+                    self._last_sent_angles = al
+                    self.rik.reset(al)
 
-            # ── [Start] → HOME ───────────────────────────────────────────
+            # ── [Start] → HOME ────────────────────────────────────────────
             if self._btn_pressed(BTN_START):
                 rospy.loginfo("[ctrl] START — returning to HOME")
                 self._move_to_home()
-                self._current_goal   = list(self._home_pos)
-                self._reset_orientation_to_home()
-                self._enabled        = False
-                self._current_angles = list(self.HOME_CONFIG)
+                actual = self._limb.joint_angles()
+                al = [actual.get(n, self.HOME_CONFIG[i]) for i, n in enumerate(JOINT_NAMES)]
+                self._current_goal     = list(self._home_pos)
+                self._enabled          = False
+                self._current_angles   = al
+                self._cmd_angles       = al
+                self._last_sent_angles = al
+                self.rik.reset(al)
 
-            # ── [Select] → re-anchor ─────────────────────────────────────
+            # ── [Select] → re-anchor IK ───────────────────────────────────
             if self._btn_pressed(BTN_SELECT):
                 self.rik.reset(list(self._current_angles))
                 cur_pos, _ = self._lookup_ee()
@@ -678,20 +786,13 @@ class PS2TeleopVizNode:
                 rospy.loginfo("[ctrl] SELECT — re-anchored at %.3f %.3f %.3f",
                               *self._current_goal)
 
-            # ── [X] → reset orientation ──────────────────────────────────
+            # ── [X] → reset orientation ───────────────────────────────────
             if self._btn_pressed(BTN_X):
                 self._reset_orientation_to_home()
                 rospy.loginfo("[ctrl] Orientation reset to home")
 
-            # ── [Y] → toggle orientation mode ────────────────────────────
-            if self._btn_pressed(BTN_Y):
-                self._ori_mode = 1 - self._ori_mode
-                mode_name = "ROLL+PITCH" if self._ori_mode == 1 else "YAW-only"
-                rospy.loginfo("[ctrl] Orientation mode → %s", mode_name)
-                print(f"  [Y] Orientation mode: {mode_name}")
-
-            # ── [R] → gripper toggle ─────────────────────────────────────
-            if self._btn_pressed(BTN_R) and self._gripper_ready:
+            # ── [Y] → toggle gripper ──────────────────────────────────────
+            if self._btn_pressed(BTN_Y) and self._gripper_ready:
                 if self._gripper_open:
                     self._gripper.close()
                     self._gripper_open = False
@@ -701,76 +802,120 @@ class PS2TeleopVizNode:
                     self._gripper_open = True
                     rospy.loginfo("[ctrl] Gripper OPEN")
 
-            # ── [L] held → motion enabled ────────────────────────────────
-            self._enabled = self._btn_held(BTN_L)
+            # ── L1 / L2 held → enable motion ──────────────────────────────
+            l1 = self._btn_held(BTN_L1)
+            l2 = self._btn_held(BTN_L2)
+            self._enabled  = l1 or l2
+            self._ori_mode = 1 if l2 else 0
             if self._enabled:
-                rospy.loginfo_throttle(1.0, "[ctrl] ENABLED — L is held")
+                rospy.loginfo_throttle(1.0, "[ctrl] ENABLED — %s",
+                                       "L2 (roll+pitch)" if l2 else "L1 (yaw+Z)")
 
             goal_pos = None
 
             if self._enabled:
-                # ── Position ─────────────────────────────────────────────
-                lx =  self._axis(AXIS_LX)    # → robot Y
-                ly = -self._axis(AXIS_LY)    # → robot X  (push fwd = +X)
-                rx =  self._axis(AXIS_RX)    # → yaw or roll
-                ry = -self._axis(AXIS_RY)    # → Z (push fwd = +Z) or pitch
-                rospy.loginfo_throttle(0.5, "[ctrl] axes raw LX=%.3f LY=%.3f RX=%.3f RY=%.3f",
-                    self._joy.get_axis(AXIS_LX), self._joy.get_axis(AXIS_LY),
-                    self._joy.get_axis(AXIS_RX), self._joy.get_axis(AXIS_RY))
+                # ── Read sticks ───────────────────────────────────────────
+                lx = -self._axis(AXIS_LX)
+                ly = -self._axis(AXIS_LY)
+                rx =  self._axis(AXIS_RX)
+                ry = -self._axis(AXIS_RY)
 
-                gx = self._current_goal[0] + ly * XY_VEL_SCALE * dt
-                gy = self._current_goal[1] + lx * XY_VEL_SCALE * dt
+                has_stick = abs(lx) + abs(ly) + abs(rx) + abs(ry) > 0.0
 
-                # ── Orientation + Z depend on mode ────────────────────────
-                if self._ori_mode == 0:
-                    # Mode 0: right stick X → yaw,  right stick Y → Z
-                    gz = self._current_goal[2] + ry * Z_VEL_SCALE * dt
-                    self._ori_yaw += rx * YAW_VEL_SCALE * dt
+                if not has_stick:
+                    # Sticks centred — read actual hardware angles and hold
+                    actual = self._limb.joint_angles()
+                    self._current_angles = [
+                        actual.get(n, self._current_angles[i])
+                        for i, n in enumerate(JOINT_NAMES)]
+                    self._publish_joint_states(self._current_angles, command_robot=False)
+
                 else:
-                    # Mode 1: right stick X → roll, right stick Y → pitch
-                    # Z is frozen (use mode 0 to change height)
-                    gz = self._current_goal[2]
-                    self._ori_roll  += rx * ROLL_VEL_SCALE  * dt
-                    self._ori_pitch += ry * PITCH_VEL_SCALE * dt
+                    # ── Integrate EE goal from sticks ─────────────────────
+                    new_gx = self._current_goal[0] + ly * XY_VEL_SCALE * dt
+                    new_gy = self._current_goal[1] + lx * XY_VEL_SCALE * dt
 
-                # ── Workspace clamping ───────────────────────────────────
-                hx, hy, _ = self._home_pos
-                bowl_floor = float(self._sensor_bowl_pos[2]) + TOOL_LENGTH
+                    if self._ori_mode == 0:          # L1: Z + yaw
+                        new_gz = self._current_goal[2] + ry * Z_VEL_SCALE * dt
+                        self._ori_yaw += rx * YAW_VEL_SCALE * dt
+                    else:                             # L2: roll + pitch
+                        new_gz = self._current_goal[2]
+                        self._ori_roll  -= ry * ROLL_VEL_SCALE  * dt
+                        self._ori_pitch += rx * PITCH_VEL_SCALE * dt
 
-                if gx < hx - 0.40: gx = hx - 0.40; rospy.logwarn_throttle(1.0, "[box] X min")
-                if gx > hx + 0.40: gx = hx + 0.40; rospy.logwarn_throttle(1.0, "[box] X max")
-                if gy < hy - 0.40: gy = hy - 0.40; rospy.logwarn_throttle(1.0, "[box] Y min")
-                if gy > hy + 0.40: gy = hy + 0.40; rospy.logwarn_throttle(1.0, "[box] Y max")
-                if gz < bowl_floor: gz = bowl_floor; rospy.logwarn_throttle(0.5,
-                    "[box] Z floor gz=%.4f", gz)
+                    # ── Proximity scale (only Cartesian helper kept) ───────
+                    new_gx, new_gy = self._apply_proximity_scale(new_gx, new_gy)
 
-                self._current_goal = [gx, gy, gz]
-                goal_pos = self._current_goal
+                    gx, gy, gz = new_gx, new_gy, new_gz   # goal moves freely at stick rate
 
-                # ── Build goal quaternion from RPY ───────────────────────
-                goal_quat = list(tft.quaternion_from_euler(
-                    self._ori_roll, self._ori_pitch, self._ori_yaw))
+                    # ── Workspace wall clamping ───────────────────────────
+                    hx, hy, _ = self._home_pos
+                    bowl_floor = float(self._sensor_bowl_pos[2]) + TOOL_LENGTH
 
-                # ── IK solve ─────────────────────────────────────────────
-                try:
-                    angles = self.rik.solve_position(
-                        positions=goal_pos,
-                        orientations=goal_quat,
-                        tolerances=[0.0] * 6)
-                    if len(angles) == 7 and all(math.isfinite(a) for a in angles):
-                        self._publish_joint_states(angles)
-                except Exception as e:
-                    rospy.logwarn_throttle(2.0, "[ctrl] IK failed: %s", e)
+                    if gx < hx - 0.40: gx = hx - 0.40; rospy.logwarn_throttle(1.0, "[box] X min")
+                    if gx > hx + 0.40: gx = hx + 0.40; rospy.logwarn_throttle(1.0, "[box] X max")
+                    if gy < hy - 0.40: gy = hy - 0.40; rospy.logwarn_throttle(1.0, "[box] Y min")
+                    if gy > hy + 0.40: gy = hy + 0.40; rospy.logwarn_throttle(1.0, "[box] Y max")
+                    if gz < bowl_floor: gz = bowl_floor; rospy.logwarn_throttle(0.5,  "[box] Z floor")
+
+                    self._current_goal = [gx, gy, gz]
+                    goal_pos = self._current_goal
+
+                    goal_quat = list(tft.quaternion_from_euler(
+                        self._ori_roll, self._ori_pitch, self._ori_yaw))
+
+                    # ── IK → rate-limit → EMA (single joint-space filter) ─
+                    try:
+                        angles = self.rik.solve_position(
+                            positions=goal_pos,
+                            orientations=goal_quat,
+                            tolerances=[0.0] * 6)
+
+                        if len(angles) == 7 and all(math.isfinite(a) for a in angles):
+                            # Warn if IK jumped wildly (helps diagnose singularities)
+                            max_delta = max(abs(a - c)
+                                           for a, c in zip(angles, self._current_angles))
+                            if max_delta > 0.20:
+                                rospy.logwarn_throttle(1.0,
+                                    "[IK] large jump %.3f rad — possible singularity", max_delta)
+
+                            # Rate-limit each joint
+                            clamped = [
+                                prev + max(-MAX_JOINT_DELTA,
+                                           min(MAX_JOINT_DELTA, new - prev))
+                                for prev, new in zip(self._current_angles, angles)
+                            ]
+                            # Single EMA smoother on joint commands
+                            self._cmd_angles = [
+                                JOINT_SMOOTH_ALPHA * a + (1.0 - JOINT_SMOOTH_ALPHA) * c
+                                for a, c in zip(clamped, self._cmd_angles)
+                            ]
+                            # Only send to robot if change exceeds deadband
+                            if max(abs(a - b) for a, b in
+                                   zip(self._cmd_angles, self._last_sent_angles)) > JOINT_CMD_DEADBAND:
+                                self._publish_joint_states(self._cmd_angles)
+                                self._last_sent_angles = list(self._cmd_angles)
+
+                    except Exception as e:
+                        rospy.logwarn_throttle(2.0, "[ctrl] IK failed: %s", e)
+
             else:
-                self._publish_joint_states(self._current_angles)
+                # Motion disabled — don't keep sending commands, let robot hold
+                self._publish_joint_states(self._current_angles, command_robot=False)
 
-            actual_pos, _ = self._lookup_ee()
-            self._publish_markers(goal_pos or self._current_goal, actual_pos, self._enabled)
-            self._publish_box()
-            self._publish_sensor_bowl()
-            self._publish_table()
+            # ── RViz update at 10 Hz (every 5th cycle) ────────────────────
+            self._viz_tick = (self._viz_tick + 1) % 5
+            if self._viz_tick == 0:
+                actual_pos, _ = self._lookup_ee()
+                self._publish_markers(goal_pos or self._current_goal, actual_pos, self._enabled)
+                self._publish_box()
+                self._publish_sensor_bowl()
+                self._publish_table()
+
             rate.sleep()
 
+
+# ─── ROS node entry point ──────────────────────────────────────────────────
 
 def main():
     node = PS2TeleopVizNode()
