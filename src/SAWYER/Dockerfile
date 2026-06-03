@@ -37,7 +37,7 @@ RUN apt-get update && apt-get install -y \
     ros-noetic-joint-state-publisher \
     && rm -rf /var/lib/apt/lists/*
  
-RUN python3 -m pip install minimalmodbus pyRobotiqGripper
+RUN python3 -m pip install "numpy==1.17.4" "pyRobotiqGripper==1.0.1"
 
 RUN python3 -m pip install pygame
  
