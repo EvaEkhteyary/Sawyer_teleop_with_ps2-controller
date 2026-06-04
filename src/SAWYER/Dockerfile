@@ -40,7 +40,13 @@ RUN apt-get update && apt-get install -y \
 RUN python3 -m pip install "numpy==1.17.4" "pyRobotiqGripper==1.0.1"
 
 RUN python3 -m pip install pygame
- 
+
+# -----------------------------
+# 1.5 Rust toolchain (to build RelaxedIK)
+# -----------------------------
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
 RUN echo "source /opt/ros/noetic/setup.bash" >> ~/.bashrc
  
 # -----------------------------
@@ -89,6 +95,14 @@ RUN cd /root/catkin_ws && \
     rosdep install --from-paths src --ignore-src -r -y
  
 # -----------------------------
+# 6.5 RelaxedIK solver + teleop package
+# -----------------------------
+COPY src/relaxed_ik_core /root/catkin_ws/src/relaxed_ik_core
+RUN cd /root/catkin_ws/src/relaxed_ik_core && cargo build --release
+
+COPY src/ps2_ik_teleop /root/catkin_ws/src/ps2_ik_teleop
+
+# -----------------------------
 # 7. Build catkin workspace
 # -----------------------------
 RUN bash -c "\
@@ -105,6 +119,6 @@ RUN apt-get update && apt-get install -y \
     net-tools nano vim iputils-ping \
     && rm -rf /var/lib/apt/lists/*
  
-RUN cp /root/catkin_ws/src/intera_sdk/intera.sh /root/catkin_ws/
+COPY intera.sh /root/catkin_ws/intera.sh
  
 CMD ["bash"]
