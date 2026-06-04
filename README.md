@@ -121,11 +121,13 @@ rosrun intera_interface enable_robot.py -e
 ## NOTE:
 
 if created container then dont recreate again in the future just, remember the container ID:
+``` bash
 sudo dokcer ps
 sudo docker start <container_name>
 sudo docker exec -it <container_name> bash
+```
 
-### no ps-controller detected!`
+### no ps-controller detected!
 - Plug the controller in **before** starting the container.
 - Confirm the host sees it: `ls /dev/input/js0` should exist.
 
