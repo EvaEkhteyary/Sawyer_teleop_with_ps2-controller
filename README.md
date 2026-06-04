@@ -1,9 +1,9 @@
-# Sawyer + PS2 controller
+# Sawyer + PS2 / USB Gamepad Teleop
 
 ROS Noetic workspace for teleoperating a Rethink Robotics **Sawyer** arm with a
 **PS2-style USB gamepad**, running fully inside Docker.
 
-Pipeline: `ps-controller (sticks + buttons)` → `RelaxedIK` → `intera_interface` → `Sawyer`.
+Pipeline: `Gamepad (sticks + buttons)` → `RelaxedIK` → `intera_interface` → `Sawyer`.
 
 Hold **L1** or **L2** while moving the sticks to drive the arm. Press **Y** to open/close the gripper.
 
@@ -62,6 +62,9 @@ Once fixed, repeat **step 2** again.
 The gamepad is passed through as `/dev/input/js0` — plug it in **before** starting the
 container.
 
+> RelaxedIK and `ps2_ik_teleop` are built into the image under `/root/catkin_ws`.
+> Do **not** bind-mount `relaxed_ik_core` over it (it would shadow the compiled `.so`).
+
 ```bash
 xhost +local:root
 
@@ -73,23 +76,22 @@ docker run -it --rm \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
   -v /dev/input:/dev/input \
   --device=/dev/input/js0 \
-  -v $REPO_PATH:/root/ps2_sawyer_ws \
-  -v $REPO_PATH/src/relaxed_ik_core:/root/catkin_ws/src/relaxed_ik_core \
-  -w /root/ps2_sawyer_ws \
+  -w /root/catkin_ws \
   sawyer_ps2controller:latest
 ```
 
 #### step 4: configure and source the ROS environment
 
-Edit `intera.sh` — set `robot_hostname` to the robot's IP and `your_ip` to your computer's
-IP. Then source it:
+Everything lives in `/root/catkin_ws`. Edit `intera.sh` — set `robot_hostname` to the
+robot's IP and `your_ip` to your computer's IP. Then source the workspace and the script:
 
 ##### terminal 1:
 
 ```bash
+cd /root/catkin_ws
 nano intera.sh
-source devel/setup.bash
-source intera.sh
+source /root/catkin_ws/devel/setup.bash
+source /root/catkin_ws/intera.sh
 roscore
 
 ```
@@ -104,8 +106,9 @@ rostopic list
 
 ##### terminal 2:
 ```bash
-docker exec -it <container_ID> bash
-source intera.sh
+cd /root/catkin_ws
+source /root/catkin_ws/devel/setup.bash
+source /root/catkin_ws/intera.sh
 python3 src/ps2_ik_teleop/scripts/test_ps2.py
 ```
 
@@ -115,19 +118,18 @@ Then hold **L1** / **L2** and use the sticks to drive the arm.
 If the robot E-stops, release it and re-enable:
 
 ```bash
+docker start -ai <container_ID>
 rosrun intera_interface enable_robot.py -e
 ```
 
 ## NOTE:
 
 if created container then dont recreate again in the future just, remember the container ID:
-``` bash
 sudo dokcer ps
 sudo docker start <container_name>
 sudo docker exec -it <container_name> bash
-```
 
-### no ps-controller detected!
-- Plug the controller in **before** starting the container.
+### `[ctrl] No joystick detected!`
+- Plug the gamepad in **before** starting the container.
 - Confirm the host sees it: `ls /dev/input/js0` should exist.
 
