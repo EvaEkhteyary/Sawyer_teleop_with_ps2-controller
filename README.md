@@ -34,10 +34,6 @@ git clone https://github.com/EvaEkhteyary/Sawyer_teleop_with_ps2-controller.git 
 cd $REPO_PATH
 ```
 
-> `src/relaxed_ik_core` (Rust IK solver) and the Sawyer packages are already vendored in
-> `src/`. Robotiq gripper support is optional — if no gripper is connected the node logs a
-> warning and continues.
-
 #### step 2: build the Docker image
 
 The Dockerfile lives at `src/SAWYER/Dockerfile` and builds ROS Noetic + the Intera SDK +
@@ -122,7 +118,6 @@ Then hold **L1** / **L2** and use the sticks to drive the arm.
 If the robot E-stops, release it and re-enable:
 
 ```bash
-docker start -ai <container_ID>
 rosrun intera_interface enable_robot.py -e
 ```
 
