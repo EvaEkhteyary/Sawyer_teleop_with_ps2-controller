@@ -68,7 +68,8 @@ container.
 ```bash
 xhost +local:root
 
-docker run -it --rm \
+docker run -it \
+  --name sawyer_ps2 \
   --privileged \
   --net=host \
   -e DISPLAY=$DISPLAY \
@@ -90,8 +91,8 @@ robot's IP and `your_ip` to your computer's IP. Then source the workspace and th
 ```bash
 cd /root/catkin_ws
 nano intera.sh
-source /root/catkin_ws/devel/setup.bash
-source /root/catkin_ws/intera.sh
+source devel/setup.bash
+source intera.sh
 roscore
 
 ```
@@ -104,11 +105,14 @@ rostopic list
 
 #### step 5: run the teleop
 
+Open a **new host terminal** and exec into the same container:
+
 ##### terminal 2:
 ```bash
+docker exec -it sawyer_ps2 bash
 cd /root/catkin_ws
-source /root/catkin_ws/devel/setup.bash
-source /root/catkin_ws/intera.sh
+source devel/setup.bash
+source intera.sh
 python3 src/ps2_ik_teleop/scripts/test_ps2.py
 ```
 
