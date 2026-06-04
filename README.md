@@ -1,9 +1,9 @@
-# Sawyer + PS2 / USB Gamepad Teleop
+# Sawyer + PS2 controller
 
 ROS Noetic workspace for teleoperating a Rethink Robotics **Sawyer** arm with a
 **PS2-style USB gamepad**, running fully inside Docker.
 
-Pipeline: `Gamepad (sticks + buttons)` → `RelaxedIK` → `intera_interface` → `Sawyer`.
+Pipeline: `ps-controller (sticks + buttons)` → `RelaxedIK` → `intera_interface` → `Sawyer`.
 
 Hold **L1** or **L2** while moving the sticks to drive the arm. Press **Y** to open/close the gripper.
 
@@ -104,6 +104,7 @@ rostopic list
 
 ##### terminal 2:
 ```bash
+docker exec -it <container_ID> bash
 source intera.sh
 python3 src/ps2_ik_teleop/scripts/test_ps2.py
 ```
@@ -114,7 +115,6 @@ Then hold **L1** / **L2** and use the sticks to drive the arm.
 If the robot E-stops, release it and re-enable:
 
 ```bash
-docker start -ai <container_ID>
 rosrun intera_interface enable_robot.py -e
 ```
 
@@ -125,7 +125,7 @@ sudo dokcer ps
 sudo docker start <container_name>
 sudo docker exec -it <container_name> bash
 
-### `[ctrl] No joystick detected!`
-- Plug the gamepad in **before** starting the container.
+### no ps-controller detected!`
+- Plug the controller in **before** starting the container.
 - Confirm the host sees it: `ls /dev/input/js0` should exist.
 
